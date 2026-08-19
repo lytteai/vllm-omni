@@ -26,11 +26,12 @@ connectors:
       connector_get_max_wait: 300
       fish_speech_tensor_codes: true
       fish_speech_single_initial_chunk: true
-      # 12 frames * 2048 hop / 44100 ≈ 557 ms of audio before first DAC emit.
-      # 8 is faster TTFA; 25 is the most stable. Client can override per request.
+      # 4 frames * 2048 hop / 44100 ≈ 186 ms of audio before first DAC emit.
+      # Matches the ~750 ms TTFA we measured on L4 with CUDA graphs.
+      # Raise to 8 if the first syllable warbles; 12 costs ~700 ms extra TTFA.
       codec_chunk_frames: 25
       codec_left_context_frames: 25
-      initial_codec_chunk_frames: 12
+      initial_codec_chunk_frames: 4
       fish_speech_dac_dtype: fp16
 
 stages:
