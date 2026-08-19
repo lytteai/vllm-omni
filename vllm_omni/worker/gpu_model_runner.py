@@ -1058,13 +1058,18 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self.input_batch.block_table.commit_block_table(num_reqs_padded)
 
                 pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
+                # vLLM 0.27 FULL-decode capture calls _dummy_run without
+                # is_graph_capturing=True. Fish kvcache still needs a CPU
+                # seq-len upper bound on that metadata or capture raises
+                # when VLLM_OMNI_FISH_KVCACHE_ATTN=required.
+                capturing = bool(is_graph_capturing or pad_attn)
                 attn_metadata, _ = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded,
                     num_tokens_padded=num_tokens_padded if pad_attn else None,
                     num_reqs=num_reqs_padded,
                     max_query_len=max_query_len,
                     ubatch_slices=(ubatch_slices_padded if pad_attn else ubatch_slices),
-                    for_cudagraph_capture=is_graph_capturing,
+                    for_cudagraph_capture=capturing,
                     slot_mappings=slot_mappings_by_group,
                     use_spec_decode=self.speculative_config is not None,
                 )
@@ -1074,7 +1079,8 @@ class OmniGPUModelRunner(GPUModelRunner):
                     num_reqs_padded=num_reqs_padded,
                     max_query_len=max_query_len,
                     pad_attn=True,
-                    for_cudagraph_capture=is_graph_capturing,
+                    for_cudagraph_capture=capturing,
+                    num_scheduled_tokens_np=num_scheduled_tokens,
                 )
 
         with self.maybe_dummy_run_with_lora(
