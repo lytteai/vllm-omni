@@ -3342,6 +3342,7 @@ class TestFishSpeechServing:
         prompt = fish_speech_server._build_fish_speech_prompt(request)
 
         assert "max_new_tokens" not in prompt["additional_information"]
+        assert "initial_codec_chunk_frames" not in prompt["additional_information"]
         encoded_texts = [text for text, _, _ in tokenizer.calls]
         assert FISH_TEXT_ONLY_SYSTEM_PROMPT in encoded_texts
         assert "<|speaker:0|>你好，[laughing]欢迎回来。<|speaker:1|>我也来了。" in encoded_texts
@@ -3399,6 +3400,14 @@ class TestFishSpeechServing:
 
         with pytest.raises(ValueError, match="unsupported control token"):
             fish_speech_server._build_fish_speech_prompt(request)
+
+    def test_build_fish_prompt_forwards_initial_codec_chunk_frames(self, fish_speech_server):
+        fish_speech_server._fish_speech_tokenizer = _FakeFishTokenizer()
+        request = OpenAICreateSpeechRequest(input="hello fish", initial_codec_chunk_frames=4)
+
+        prompt = fish_speech_server._build_fish_speech_prompt(request)
+
+        assert prompt["additional_information"]["initial_codec_chunk_frames"] == [4]
 
     def test_prepare_speech_generation_overrides_fish_default_max_tokens(
         self, fish_speech_server, mocker: MockerFixture

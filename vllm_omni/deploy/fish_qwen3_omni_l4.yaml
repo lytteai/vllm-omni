@@ -1,15 +1,13 @@
 # Fish Speech S2 Pro — single NVIDIA L4 24GB, low-latency phone TTS.
 #
-# Why this is not the default fish_qwen3_omni.yaml:
-#   * Default max_model_len=16384 over-allocates KV on 24GB (Stage0 ~20GB).
-#   * Default connector_get_sleep_s=10ms adds up to 10ms to every DAC chunk.
-#   * Default initial_codec_chunk_frames=4 is too small for DAC (warbly start)
-#     and, without single_initial_chunk, re-decodes 4/8/12/… overlapping windows.
-#   * Default max_num_seqs=4 wastes CUDA-graph / KV budget on a 1-call bot.
+# Tuned for one in-flight call: FULL decode CUDA graphs at batch=1, greedy
+# Fast AR (Slow AR stays sampled), 4-frame first DAC chunk, 10-frame steady
+# chunks so the client is not flooded with 1.2 s bursts.
 #
 # Slow AR decode is not chunked-prefill-safe — keep enable_chunked_prefill false
 # and max_num_batched_tokens >= max_model_len.
 #
+#   unset VLLM_OMNI_FISH_KVCACHE_ATTN   # default ON; do not set required until capture succeeds
 #   vllm serve fishaudio/s2-pro --omni --port 8000 \
 #       --deploy-config vllm_omni/deploy/fish_qwen3_omni_l4.yaml
 
@@ -26,17 +24,16 @@ connectors:
       connector_get_max_wait: 300
       fish_speech_tensor_codes: true
       fish_speech_single_initial_chunk: true
-      # 4 frames * 2048 hop / 44100 ≈ 186 ms of audio before first DAC emit.
-      # Matches the ~750 ms TTFA we measured on L4 with CUDA graphs.
-      # Raise to 8 if the first syllable warbles; 12 costs ~700 ms extra TTFA.
-      codec_chunk_frames: 25
+      # 4 frames * 2048 hop / 44100 ≈ 186 ms first audio. Raise to 8 if the
+      # first syllable warbles. 12 costs ~700 ms extra TTFA.
+      codec_chunk_frames: 10
       codec_left_context_frames: 25
       initial_codec_chunk_frames: 4
       fish_speech_dac_dtype: fp16
 
 stages:
   - stage_id: 0
-    max_num_seqs: 2
+    max_num_seqs: 1
     gpu_memory_utilization: 0.78
     enforce_eager: false
     trust_remote_code: true
@@ -45,6 +42,17 @@ stages:
     max_num_batched_tokens: 4096
     max_model_len: 4096
     devices: "0"
+    compilation_config:
+      cudagraph_mode: FULL_DECODE_ONLY
+      cudagraph_capture_sizes: [1]
+      cudagraph_num_of_warmups: 1
+    # Fast AR residual codes: argmax is graph-safe and skips 9 multinomials
+    # per Slow AR step. Slow AR semantic sampling stays at temperature 0.8.
+    subtalker_sampling_params:
+      do_sample: false
+      temperature: 0.0
+      top_k: 1
+      top_p: 1.0
     output_connectors:
       to_stage_1: connector_of_shared_memory
     default_sampling_params:
@@ -56,7 +64,7 @@ stages:
       repetition_penalty: 1.0
 
   - stage_id: 1
-    max_num_seqs: 2
+    max_num_seqs: 1
     gpu_memory_utilization: 0.12
     enforce_eager: true
     trust_remote_code: true

@@ -2698,6 +2698,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             }
             if request.max_new_tokens is not None:
                 additional_information["max_new_tokens"] = [request.max_new_tokens]
+            if request.initial_codec_chunk_frames is not None:
+                additional_information["initial_codec_chunk_frames"] = [request.initial_codec_chunk_frames]
             prompt = tokens_input(prompt_token_ids=prompt_ids)
             prompt["additional_information"] = additional_information
             return prompt
@@ -2723,6 +2725,8 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 additional_information["voice_created_at"] = self._voice_created_at(voice_lower)
         if request.max_new_tokens is not None:
             additional_information["max_new_tokens"] = request.max_new_tokens
+        if request.initial_codec_chunk_frames is not None:
+            additional_information["initial_codec_chunk_frames"] = [request.initial_codec_chunk_frames]
         prompt = tokens_input(prompt_token_ids=[1] * ph_len)
         prompt["additional_information"] = additional_information
         return prompt
