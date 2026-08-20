@@ -4392,7 +4392,7 @@ def test_speech_stream_preroll_auto_from_prompt(monkeypatch):
     )
     text = "Hello, this is Sandy from Arizona Care Network"
     est_s = len(text) / 16.0
-    expected = max(900, min(3500, int(est_s * (1.0 - 0.62) * 1100.0)))
+    expected = max(900, min(3500, int(est_s * (1.0 - 0.62) * 1250.0)))
     assert _speech_stream_preroll_ms_from_config(cfg, prompt_text=text) == expected
     assert _speech_stream_preroll_ms_from_config(cfg, prompt_text="Hi") == 900
 

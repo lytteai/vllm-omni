@@ -6,11 +6,11 @@
 # Do not capture a custom Fast AR CUDA graph — static-KV SDPA / graph replay
 # corrupts residual codes and the voice stops sounding human.
 #
-# First DAC window is 4 frames (~186 ms audio, ~370 ms wall). Do not HTTP-preroll
-# here — the phone client must coalesce ~800 ms of 44.1 kHz PCM before the first
-# Twilio send. Server preroll + Redis-per-TCP-frame stacked to 3s+ TTFT.
-# Each Slow AR token is 2048/44100 ≈ 46.4 ms of audio; L4 ITL is ~75 ms (~0.62x).
-# Clients must send stream=true AND stream_format="audio" for raw PCM/WAV.
+# First DAC window is 4 frames (~186 ms audio, ~370 ms wall). HTTP then holds a
+# prompt-sized PCM waterline so Twilio does not underrun on 0.62x L4 generation.
+# ITL spikes above 76 ms are why cutoff is intermittent — budget rtf 0.55.
+# GPU ~95% during decode is expected (L4 is compute-bound, not idle).
+# Clients: stream=true, stream_format="audio", and no extra client preroll.
 #
 # Slow AR decode is not chunked-prefill-safe — keep enable_chunked_prefill false
 # and max_num_batched_tokens >= max_model_len.
@@ -29,16 +29,20 @@ connectors:
       codec_streaming: true
       connector_get_sleep_s: 0.001
       connector_get_max_wait_first_chunk: 3000
-      connector_get_max_wait: 300
+      # 4 Slow AR steps * ~76 ms ≈ 304 ms; 300 was too tight when ITL spikes.
+      connector_get_max_wait: 2000
       fish_speech_tensor_codes: true
       fish_speech_single_initial_chunk: true
-      # 4-frame DAC (~186 ms). First HTTP audio ~370 ms; the Twilio client
-      # holds ~800 ms before the first media send so playback does not underrun.
       codec_chunk_frames: 4
       codec_left_context_frames: 25
       initial_codec_chunk_frames: 4
-      speech_stream_preroll_auto: false
-      speech_stream_preroll_ms: 0
+      # Hold enough PCM to cover estimated duration at a conservative 0.55x RTF.
+      # Short lines ~0.5–1.0 s to first HTTP byte; long IVR holds more, not 20 frames.
+      speech_stream_preroll_auto: true
+      speech_stream_preroll_min_ms: 500
+      speech_stream_preroll_max_ms: 2000
+      speech_stream_gen_rtf: 0.55
+      speech_stream_chars_per_sec: 12
 
 stages:
   - stage_id: 0

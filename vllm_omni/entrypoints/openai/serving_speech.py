@@ -238,7 +238,7 @@ def _speech_stream_preroll_ms_from_config(
         cps = max(_as_float(_first_connector_extra_value(extras, "speech_stream_chars_per_sec"), 16.0), 1.0)
         text_len = len(prompt_text or "")
         est_s = max(text_len / cps, min_ms / 1000.0)
-        needed_ms = int(est_s * (1.0 - rtf) * 1100.0)
+        needed_ms = int(est_s * (1.0 - rtf) * 1250.0)
         return max(min_ms, min(max_ms, needed_ms))
 
     return max(0, _as_int(_first_connector_extra_value(extras, "speech_stream_preroll_ms"), 0))
