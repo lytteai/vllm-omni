@@ -137,6 +137,113 @@ def _is_default_voice(voice, supported_speakers):
     return voice == _DEFAULT_VOICE_NAME and voice not in supported_speakers
 
 
+def _pcm16_duration_ms(n_bytes: int, sample_rate: int) -> float:
+    """Duration of packed little-endian PCM16 mono bytes."""
+    if n_bytes <= 0 or sample_rate <= 0:
+        return 0.0
+    return (n_bytes / 2.0) * 1000.0 / float(sample_rate)
+
+
+def _connector_extra_from_model_config(model_config: Any) -> dict[str, Any]:
+    """Return ``stage_connector_config.extra`` when present."""
+    connector_cfg = getattr(model_config, "stage_connector_config", None)
+    if isinstance(connector_cfg, dict):
+        raw_extra = connector_cfg.get("extra", connector_cfg)
+        return raw_extra if isinstance(raw_extra, dict) else {}
+    return {}
+
+
+def _collect_speech_connector_extras(model_config: Any, engine_client: Any | None = None) -> list[dict[str, Any]]:
+    """Gather connector extras from the API model config and every stage."""
+    configs: list[Any] = [model_config]
+    if engine_client is not None:
+        configs.append(getattr(engine_client, "model_config", None))
+        engine = getattr(engine_client, "engine", None)
+        for holder in (engine_client, engine):
+            if holder is None:
+                continue
+            for vllm_cfg in getattr(holder, "stage_vllm_configs", None) or []:
+                configs.append(getattr(vllm_cfg, "model_config", None))
+    extras: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for cfg in configs:
+        extra = _connector_extra_from_model_config(cfg)
+        if not extra:
+            continue
+        ident = id(extra)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        extras.append(extra)
+    return extras
+
+
+def _first_connector_extra_value(extras: list[dict[str, Any]], key: str) -> Any:
+    for extra in extras:
+        if key in extra and extra[key] is not None:
+            return extra[key]
+    return None
+
+
+def _speech_stream_preroll_ms_from_config(
+    model_config: Any,
+    engine_client: Any | None = None,
+    prompt_text: str | None = None,
+) -> int:
+    """Hold this many ms of PCM before the first streamed audio byte.
+
+    L4 Fish generates slower than realtime (~0.62x). Starting playback on the
+    first DAC crumb underruns. A waterline lets the HTTP client start sooner
+    than a full WAV while keeping enough buffer to finish a typical IVR line.
+
+    ``VLLM_OMNI_SPEECH_STREAM_PREROLL_MS`` overrides yaml when set.
+    ``speech_stream_preroll_auto`` sizes the waterline from prompt length.
+    """
+    extras = _collect_speech_connector_extras(model_config, engine_client)
+    env_raw = os.environ.get("VLLM_OMNI_SPEECH_STREAM_PREROLL_MS")
+    if env_raw is not None and str(env_raw).strip() != "":
+        try:
+            return max(0, int(env_raw))
+        except (TypeError, ValueError):
+            return 0
+
+    def _as_int(raw: Any, default: int) -> int:
+        if raw is None:
+            return default
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return default
+
+    def _as_float(raw: Any, default: float) -> float:
+        if raw is None:
+            return default
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return default
+
+    def _as_bool(raw: Any) -> bool:
+        if isinstance(raw, bool):
+            return raw
+        if raw is None:
+            return False
+        return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+    auto = _as_bool(_first_connector_extra_value(extras, "speech_stream_preroll_auto"))
+    if auto:
+        min_ms = max(0, _as_int(_first_connector_extra_value(extras, "speech_stream_preroll_min_ms"), 900))
+        max_ms = max(min_ms, _as_int(_first_connector_extra_value(extras, "speech_stream_preroll_max_ms"), 3500))
+        rtf = min(max(_as_float(_first_connector_extra_value(extras, "speech_stream_gen_rtf"), 0.62), 0.05), 0.95)
+        cps = max(_as_float(_first_connector_extra_value(extras, "speech_stream_chars_per_sec"), 16.0), 1.0)
+        text_len = len(prompt_text or "")
+        est_s = max(text_len / cps, min_ms / 1000.0)
+        needed_ms = int(est_s * (1.0 - rtf) * 1100.0)
+        return max(min_ms, min(max_ms, needed_ms))
+
+    return max(0, _as_int(_first_connector_extra_value(extras, "speech_stream_preroll_ms"), 0))
+
+
 def _create_wav_header(sample_rate: int, num_channels: int = 1, bits_per_sample: int = 16) -> bytes:
     """Create a WAV header with placeholder size values for streaming.
 
@@ -2224,6 +2331,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         include_sample_rate: bool = False,
         usage_acc: SpeechOutputTokenCounter | None = None,
         collect: dict | None = None,
+        preroll_prompt: str | None = None,
     ):
         """Generate audio chunks for streaming response.
 
@@ -2247,6 +2355,44 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         first_audio_chunk_s: float | None = None
         stream_start_s = request_start_s if request_start_s is not None else time.perf_counter()
         artifact_ready = False
+        preroll_ms = _speech_stream_preroll_ms_from_config(
+            getattr(self.engine_client, "model_config", None),
+            engine_client=self.engine_client,
+            prompt_text=preroll_prompt,
+        )
+        preroll_buf = bytearray()
+        preroll_held = preroll_ms > 0
+        if preroll_held:
+            logger.info(
+                "Speech stream preroll enabled: %d ms request_id=%s prompt_chars=%d",
+                preroll_ms,
+                request_id,
+                len(preroll_prompt or ""),
+            )
+        wav_channels = 1
+
+        def _release_stream_bytes(audio_bytes: bytes) -> list[bytes]:
+            nonlocal first_chunk, first_audio_chunk_s, preroll_held
+            parts: list[bytes] = []
+            if preroll_held:
+                preroll_buf.extend(audio_bytes)
+                if _pcm16_duration_ms(len(preroll_buf), sample_rate_val) < preroll_ms:
+                    return parts
+                audio_bytes = bytes(preroll_buf)
+                preroll_buf.clear()
+                preroll_held = False
+            if response_format == "wav" and first_chunk:
+                wav_header = _create_wav_header(
+                    sample_rate=sample_rate_val,
+                    num_channels=wav_channels,
+                    bits_per_sample=16,
+                )
+                parts.append(wav_header)
+                first_chunk = False
+            if first_audio_chunk_s is None:
+                first_audio_chunk_s = time.perf_counter()
+            parts.append(audio_bytes)
+            return parts
 
         try:
             async for res in generator:
@@ -2290,23 +2436,12 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         # as first audio; the post-loop guard below needs to
                         # see an audio-less stream to fail the request.
                         continue
-                    # For WAV format, emit header before first audio chunk
                     if response_format == "wav" and first_chunk:
-                        # Assert that sample rate has been set from chunk metadata (not just default)
-                        # This ensures the WAV header contains the correct sample rate
                         assert sr_raw is not None, (
                             "First audio chunk must include sample rate metadata for WAV streaming"
                         )
-                        num_channels = _infer_audio_num_channels(np.asarray(chunk_np))
-                        wav_header = _create_wav_header(
-                            sample_rate=sample_rate_val,
-                            num_channels=num_channels,
-                            bits_per_sample=16,
-                        )
-                        yield wav_header
-                        first_chunk = False
+                        wav_channels = _infer_audio_num_channels(np.asarray(chunk_np))
 
-                    # Convert audio to PCM bytes
                     audio_obj = CreateAudio(
                         audio_tensor=chunk_np,
                         sample_rate=sample_rate_val,
@@ -2314,13 +2449,21 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         speed=1.0,
                         base64_encode=False,
                     )
-                    if first_audio_chunk_s is None:
-                        first_audio_chunk_s = time.perf_counter()
                     audio_bytes = self.create_audio(audio_obj).audio_data
-                    if include_sample_rate:
-                        yield audio_bytes, sample_rate_val
+                    for part in _release_stream_bytes(audio_bytes):
+                        if include_sample_rate and not part.startswith(b"RIFF"):
+                            yield part, sample_rate_val
+                        else:
+                            yield part
+            if preroll_buf:
+                leftover = bytes(preroll_buf)
+                preroll_buf.clear()
+                preroll_held = False
+                for part in _release_stream_bytes(leftover):
+                    if include_sample_rate and not part.startswith(b"RIFF"):
+                        yield part, sample_rate_val
                     else:
-                        yield audio_bytes
+                        yield part
             if self._tts_model_type in _AUDEX_NO_AUDIO_GUARD_MODEL_TYPES and first_audio_chunk_s is None:
                 # Audex contract: zero codec tokens must abort the stream, not
                 # complete it cleanly with zero audio bytes.
@@ -2417,6 +2560,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 raw_request=raw_request,
                 request_start_s=request_start_s,
                 usage_acc=usage_acc,
+                preroll_prompt=getattr(request, "input", None),
             ):
                 payload = {
                     "type": "speech.audio.delta",
@@ -3161,7 +3305,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         return request_id, generator, tts_params
 
     async def _generate_pcm_chunks(
-        self, generator, request_id: str, *, include_sample_rate: bool = False, collect: dict | None = None
+        self,
+        generator,
+        request_id: str,
+        *,
+        include_sample_rate: bool = False,
+        collect: dict | None = None,
+        preroll_prompt: str | None = None,
     ):
         """Yield raw PCM byte chunks from the engine generator.
 
@@ -3176,6 +3326,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             response_format="pcm",
             include_sample_rate=include_sample_rate,
             collect=collect,
+            preroll_prompt=preroll_prompt,
         ):
             yield chunk
 
@@ -3183,7 +3334,11 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         """Yield raw PCM bytes for a speech request as soon as chunks are decoded."""
         request_id, generator, _ = await self._prepare_speech_generation(request)
         try:
-            async for chunk in self._generate_pcm_chunks(generator, request_id):
+            async for chunk in self._generate_pcm_chunks(
+                generator,
+                request_id,
+                preroll_prompt=request.input,
+            ):
                 yield chunk
         finally:
             self._discard_ref_audio_artifact_warmup(request_id)
@@ -3586,6 +3741,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                         response_format,
                         raw_request=raw_request,
                         request_start_s=request_start_s,
+                        preroll_prompt=request.input,
                     ),
                     media_type=media_type,
                 )

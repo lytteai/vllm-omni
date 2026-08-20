@@ -192,8 +192,6 @@ def slow_ar_to_dac_decoder_async_chunk(
             f"codec_left_context_frames={left_context_size_config}, "
             f"initial_codec_chunk_frames={initial_chunk_size}"
         )
-    if initial_chunk_size > chunk_size:
-        initial_chunk_size = chunk_size
 
     length = len(transfer_manager.code_prompt_token_ids[request_id])
     steady_chunk_size = _select_backlog_chunk_size(transfer_manager, cfg, chunk_size, length)
@@ -227,7 +225,7 @@ def slow_ar_to_dac_decoder_async_chunk(
             "fish_speech_single_initial_chunk",
             False,
         )
-        use_first_chunk = initial_chunk_size > 0 and initial_chunk_size < steady_chunk_size
+        use_first_chunk = initial_chunk_size > 0 and initial_chunk_size != steady_chunk_size
 
         if single_initial_chunk and use_first_chunk:
             if length <= initial_chunk_size:

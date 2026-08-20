@@ -28,6 +28,7 @@ from vllm_omni.entrypoints.openai import api_server as api_server_module
 from vllm_omni.entrypoints.openai import serving_speech as serving_speech_module
 from vllm_omni.entrypoints.openai.audio_utils_mixin import AudioMixin
 from vllm_omni.entrypoints.openai.protocol.audio import (
+    AudioResponse,
     BatchSpeechRequest,
     CreateAudio,
     OpenAICreateAudioGenerateRequest,
@@ -41,6 +42,8 @@ from vllm_omni.entrypoints.openai.serving_speech import (
     _TTS_LANGUAGES,
     OmniOpenAIServingSpeech,
     _create_wav_header,
+    _pcm16_duration_ms,
+    _speech_stream_preroll_ms_from_config,
 )
 from vllm_omni.entrypoints.openai.tts_adapters.base import PreparedRequest, SpeechServingContext
 from vllm_omni.entrypoints.openai.tts_adapters.ming_tts import MingTTSAdapter
@@ -4352,3 +4355,84 @@ class TestTTSAsyncOffloading:
         server = OmniOpenAIServingSpeech.for_diffusion(diffusion_engine=mocker.MagicMock(), model_name="test-model")
         assert server._tts_executor is None
         server.shutdown()  # Should not raise
+
+
+def test_pcm16_duration_ms():
+    assert _pcm16_duration_ms(44100 * 2, 44100) == 1000.0
+    assert _pcm16_duration_ms(0, 44100) == 0.0
+    assert _pcm16_duration_ms(100, 0) == 0.0
+
+
+def test_speech_stream_preroll_ms_from_config(monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_SPEECH_STREAM_PREROLL_MS", raising=False)
+    cfg = SimpleNamespace(stage_connector_config={"extra": {"speech_stream_preroll_ms": 1500}})
+    assert _speech_stream_preroll_ms_from_config(cfg) == 1500
+    assert _speech_stream_preroll_ms_from_config(None) == 0
+    assert _speech_stream_preroll_ms_from_config(SimpleNamespace()) == 0
+
+
+def test_speech_stream_preroll_env_overrides_yaml(monkeypatch):
+    cfg = SimpleNamespace(stage_connector_config={"extra": {"speech_stream_preroll_ms": 1500}})
+    monkeypatch.setenv("VLLM_OMNI_SPEECH_STREAM_PREROLL_MS", "800")
+    assert _speech_stream_preroll_ms_from_config(cfg) == 800
+
+
+def test_speech_stream_preroll_auto_from_prompt(monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_SPEECH_STREAM_PREROLL_MS", raising=False)
+    cfg = SimpleNamespace(
+        stage_connector_config={
+            "extra": {
+                "speech_stream_preroll_auto": True,
+                "speech_stream_preroll_min_ms": 900,
+                "speech_stream_preroll_max_ms": 3500,
+                "speech_stream_gen_rtf": 0.62,
+                "speech_stream_chars_per_sec": 16,
+            }
+        }
+    )
+    text = "Hello, this is Sandy from Arizona Care Network"
+    est_s = len(text) / 16.0
+    expected = max(900, min(3500, int(est_s * (1.0 - 0.62) * 1100.0)))
+    assert _speech_stream_preroll_ms_from_config(cfg, prompt_text=text) == expected
+    assert _speech_stream_preroll_ms_from_config(cfg, prompt_text="Hi") == 900
+
+
+def test_speech_stream_preroll_reads_stage_vllm_configs(monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_SPEECH_STREAM_PREROLL_MS", raising=False)
+    engine_client = SimpleNamespace(
+        model_config=SimpleNamespace(),
+        stage_vllm_configs=[
+            SimpleNamespace(
+                model_config=SimpleNamespace(
+                    stage_connector_config={"extra": {"speech_stream_preroll_ms": 1200}}
+                )
+            )
+        ],
+    )
+    assert _speech_stream_preroll_ms_from_config(None, engine_client=engine_client) == 1200
+
+
+@pytest.mark.asyncio
+async def test_fish_stream_preroll_holds_until_buffer_fills(fish_speech_server, mocker: MockerFixture, monkeypatch):
+    monkeypatch.delenv("VLLM_OMNI_SPEECH_STREAM_PREROLL_MS", raising=False)
+    fish_speech_server.engine_client.model_config.stage_connector_config = {
+        "extra": {"speech_stream_preroll_ms": 1000}
+    }
+    mocker.patch.object(
+        fish_speech_server,
+        "create_audio",
+        return_value=AudioResponse(audio_data=b"\x00" * 44100, media_type="audio/pcm"),
+    )
+
+    async def gen():
+        for _ in range(2):
+            yield SimpleNamespace(
+                multimodal_output={
+                    "model_outputs": torch.zeros(8, dtype=torch.float32),
+                    "sr": 44100,
+                }
+            )
+
+    chunks = [part async for part in fish_speech_server._generate_audio_chunks(gen(), "req-preroll")]
+    assert len(chunks) == 1
+    assert len(chunks[0]) == 88200

@@ -296,3 +296,25 @@ def test_request_initial_chunk_frames_overrides_ramp():
     )
     assert payload is not None
     assert payload.codes.audio.shape[-1] == 2
+
+
+def test_single_initial_chunk_can_exceed_steady_chunk():
+    transfer_manager = _make_transfer_manager(
+        tensor_payload=True,
+        chunk_frames=4,
+        left_context=5,
+        initial_chunk_frames=8,
+        single_initial_chunk=True,
+    )
+
+    assert _call_seeded(transfer_manager, n_frames=4) is None
+    first = _call_seeded(transfer_manager, n_frames=8)
+    assert first is not None
+    assert first.meta.left_context_size == 0
+    assert first.codes.audio.shape[-1] == 8
+
+    assert _call_seeded(transfer_manager, n_frames=10) is None
+    second = _call_seeded(transfer_manager, n_frames=12)
+    assert second is not None
+    assert second.meta.left_context_size == 5
+    assert second.codes.audio.shape[-1] == 9

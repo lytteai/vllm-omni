@@ -6,13 +6,15 @@
 # Do not capture a custom Fast AR CUDA graph — static-KV SDPA / graph replay
 # corrupts residual codes and the voice stops sounding human.
 #
-# 4-frame DAC chunks (~186 ms). Each Slow AR token is 2048/44100 ≈ 46.4 ms
-# of audio. 10-frame chunks open playback holes when Stage-0 ITL > 46 ms.
+# First DAC window ~20 frames (~928 ms). HTTP preroll then holds until the
+# waterline (auto from prompt length). Each Slow AR token is 2048/44100 ≈
+# 46.4 ms of audio; L4 ITL is ~75 ms so generation is ~0.62x realtime.
+# Clients must send stream=true AND stream_format="audio" for raw PCM/WAV.
 #
 # Slow AR decode is not chunked-prefill-safe — keep enable_chunked_prefill false
 # and max_num_batched_tokens >= max_model_len.
 #
-#   unset VLLM_OMNI_FISH_KVCACHE_ATTN   # default ON; do not set required until capture succeeds
+#   unset VLLM_OMNI_FISH_KVCACHE_ATTN
 #   vllm serve fishaudio/s2-pro --omni --port 8000 \
 #       --deploy-config vllm_omni/deploy/fish_qwen3_omni_l4.yaml
 
@@ -29,12 +31,19 @@ connectors:
       connector_get_max_wait: 300
       fish_speech_tensor_codes: true
       fish_speech_single_initial_chunk: true
-      # 4-frame chunks (~186 ms). Stay here until Stage-0 vllm_itl_ms < 46.
-      # 1–2 frame first audio warbles; ramping to 10 frames underruns on L4.
+      # Steady 4-frame DAC (~186 ms). First window is larger so the HTTP
+      # preroll is one clean decode, not eight 186 ms crumbs.
       codec_chunk_frames: 4
       codec_left_context_frames: 25
-      initial_codec_chunk_frames: 4
-      fish_speech_dac_dtype: fp16
+      initial_codec_chunk_frames: 20
+      # Auto waterline: hold ~ (est_audio * (1 - rtf)) of PCM, then stream.
+      # Short IVR gets first audio before a full WAV; long lines still need
+      # a GPU faster than realtime to never underrun.
+      speech_stream_preroll_auto: true
+      speech_stream_preroll_min_ms: 900
+      speech_stream_preroll_max_ms: 3500
+      speech_stream_gen_rtf: 0.62
+      speech_stream_chars_per_sec: 16
 
 stages:
   - stage_id: 0

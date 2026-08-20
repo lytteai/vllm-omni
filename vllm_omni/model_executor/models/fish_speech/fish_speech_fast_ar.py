@@ -388,6 +388,7 @@ class FishSpeechFastAR(nn.Module):
         self._pos_ids: torch.Tensor | None = None
         self._k_cache: torch.Tensor | None = None
         self._v_cache: torch.Tensor | None = None
+        self._codes_buf: torch.Tensor | None = None
         self._compiled_model_fwd: object | None = None
         self._compiled_model_one: object | None = None
         self._compile_attempted = False
@@ -410,6 +411,9 @@ class FishSpeechFastAR(nn.Module):
             and self._k_cache.shape[1] >= bsz
             and self._k_cache.device == device
             and self._k_cache.dtype == dtype
+            and getattr(self, "_codes_buf", None) is not None
+            and self._codes_buf.shape[0] >= bsz
+            and self._codes_buf.device == device
         ):
             return
         self._embed_buf = torch.zeros(bsz, max_seq, self._fast_dim, dtype=dtype, device=device)
@@ -419,6 +423,7 @@ class FishSpeechFastAR(nn.Module):
         head_dim = self.config.head_dim
         self._k_cache = torch.empty(num_layers, bsz, num_kv_heads, max_seq, head_dim, dtype=dtype, device=device)
         self._v_cache = torch.empty_like(self._k_cache)
+        self._codes_buf = torch.empty(bsz, self._num_codebooks, dtype=torch.long, device=device)
 
     def _setup_compile(self) -> None:
         if self._compile_attempted:
@@ -520,10 +525,10 @@ class FishSpeechFastAR(nn.Module):
         # Clamp to valid range: im_end or other non-semantic tokens map to 0 (pad).
         semantic_code = (semantic_token_id.reshape(bsz) - semantic_begin).clamp(min=0, max=codebook_size - 1)
 
-        all_codes = torch.empty(bsz, num_cb, dtype=torch.long, device=device)
-        all_codes[:, 0] = semantic_code
-
         self._ensure_buffers(bsz, device, dtype)
+        assert self._codes_buf is not None
+        all_codes = self._codes_buf[:bsz]
+        all_codes[:, 0] = semantic_code
 
         embed_buf = self._embed_buf
         pos_ids = self._pos_ids
