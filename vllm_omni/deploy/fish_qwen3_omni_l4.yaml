@@ -6,9 +6,10 @@
 # Do not capture a custom Fast AR CUDA graph — static-KV SDPA / graph replay
 # corrupts residual codes and the voice stops sounding human.
 #
-# First DAC window ~20 frames (~928 ms). HTTP preroll then holds until the
-# waterline (auto from prompt length). Each Slow AR token is 2048/44100 ≈
-# 46.4 ms of audio; L4 ITL is ~75 ms so generation is ~0.62x realtime.
+# First DAC window is 4 frames (~186 ms audio, ~370 ms wall). Do not HTTP-preroll
+# here — the phone client must coalesce ~800 ms of 44.1 kHz PCM before the first
+# Twilio send. Server preroll + Redis-per-TCP-frame stacked to 3s+ TTFT.
+# Each Slow AR token is 2048/44100 ≈ 46.4 ms of audio; L4 ITL is ~75 ms (~0.62x).
 # Clients must send stream=true AND stream_format="audio" for raw PCM/WAV.
 #
 # Slow AR decode is not chunked-prefill-safe — keep enable_chunked_prefill false
@@ -31,19 +32,13 @@ connectors:
       connector_get_max_wait: 300
       fish_speech_tensor_codes: true
       fish_speech_single_initial_chunk: true
-      # Steady 4-frame DAC (~186 ms). First window is larger so the HTTP
-      # preroll is one clean decode, not eight 186 ms crumbs.
+      # 4-frame DAC (~186 ms). First HTTP audio ~370 ms; the Twilio client
+      # holds ~800 ms before the first media send so playback does not underrun.
       codec_chunk_frames: 4
       codec_left_context_frames: 25
-      initial_codec_chunk_frames: 20
-      # Auto waterline: hold ~ (est_audio * (1 - rtf)) of PCM, then stream.
-      # Short IVR gets first audio before a full WAV; long lines still need
-      # a GPU faster than realtime to never underrun.
-      speech_stream_preroll_auto: true
-      speech_stream_preroll_min_ms: 900
-      speech_stream_preroll_max_ms: 3500
-      speech_stream_gen_rtf: 0.62
-      speech_stream_chars_per_sec: 16
+      initial_codec_chunk_frames: 4
+      speech_stream_preroll_auto: false
+      speech_stream_preroll_ms: 0
 
 stages:
   - stage_id: 0
