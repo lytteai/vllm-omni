@@ -47,6 +47,21 @@ def test_noncontiguous_tensor_serialization():
     assert torch.equal(tensor, deserialized["codes"])
 
 
+def test_size1_last_dim_tensor_serialization():
+    """Fish first DAC chunk is [num_codebooks, 1]; that view is 'contiguous' with stride(-1)!=1."""
+    import torch
+
+    tensor = torch.arange(10, dtype=torch.long).reshape(1, 10).transpose(0, 1)
+    assert tensor.shape == (10, 1)
+    assert tensor.is_contiguous()
+    assert tensor.stride(-1) != 1
+
+    serialized = OmniSerializer.serialize({"codes": tensor})
+    deserialized = OmniSerializer.deserialize(serialized)
+
+    assert torch.equal(tensor, deserialized["codes"])
+
+
 def test_ndarray_serialization():
     """Test numpy.ndarray serialization."""
     import numpy as np

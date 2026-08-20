@@ -248,6 +248,7 @@ def test_codec_chunk_ramp_emits_after_one_slow_ar_frame():
     )
     assert first is not None
     assert first.codes.audio.shape[-1] == 1
+    assert first.codes.audio.stride(-1) == 1
     transfer_manager.ramp_chunk_count["req"] += 1
 
     assert (

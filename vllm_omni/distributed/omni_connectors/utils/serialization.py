@@ -90,7 +90,11 @@ class OmniMsgpackEncoder:
         # Handle 0-dimensional (scalar) tensors by reshaping to 1D first
         if t.dim() == 0:
             t = t.reshape(1)
-        if not t.is_contiguous():
+        # ``is_contiguous()`` is true for some size-1 views whose last stride
+        # is not 1 (Fish Speech first DAC chunk is [num_codebooks, 1] after
+        # transpose). ``view(uint8)`` still requires stride(-1) == 1 when the
+        # element size changes.
+        if t.stride(-1) != 1 or not t.is_contiguous():
             t = t.contiguous()
         t = t.view(torch.uint8)
         return {

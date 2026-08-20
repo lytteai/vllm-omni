@@ -271,6 +271,10 @@ def slow_ar_to_dac_decoder_async_chunk(
     # a single placeholder token and consumes the real codes from runtime info.
     stacked_frames = torch.stack(window_frames, dim=0)
     codes_qf = stacked_frames.transpose(0, 1).contiguous()
+    # [Q, 1] after transpose is "contiguous" with stride(-1)==Q; SHM encode
+    # views Long as Byte and requires last stride 1.
+    if codes_qf.stride(-1) != 1:
+        codes_qf = codes_qf.clone()
     if _use_tensor_code_payload(transfer_manager):
         code_predictor_codes = codes_qf
     else:

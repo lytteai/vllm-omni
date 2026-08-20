@@ -357,7 +357,9 @@ def unflatten_payload(flat: dict[str, Any]) -> dict[str, Any]:
 def _serialize_tensor(t: torch.Tensor) -> AdditionalInformationEntry:
     from vllm_omni.engine import AdditionalInformationEntry
 
-    t_cpu = t.detach().to("cpu").contiguous()
+    t_cpu = t.detach().to("cpu")
+    if t_cpu.stride(-1) != 1 or not t_cpu.is_contiguous():
+        t_cpu = t_cpu.contiguous()
     return AdditionalInformationEntry(
         tensor_data=t_cpu.numpy().tobytes(),
         tensor_shape=list(t_cpu.shape),
