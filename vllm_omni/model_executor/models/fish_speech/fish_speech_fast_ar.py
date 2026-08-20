@@ -389,6 +389,7 @@ class FishSpeechFastAR(nn.Module):
         self._k_cache: torch.Tensor | None = None
         self._v_cache: torch.Tensor | None = None
         self._compiled_model_fwd: object | None = None
+        self._compiled_model_one: object | None = None
         self._compile_attempted = False
         self._compile_failed = False
         self._disable_compile_for_graph = False
@@ -423,16 +424,22 @@ class FishSpeechFastAR(nn.Module):
         if self._compile_attempted:
             return
         self._compile_attempted = True
+        # Decode uses forward_one (one residual token + KV cache), not the
+        # full-sequence forward. Compiling the unused path did not help TTFT.
+        try:
+            self._compiled_model_one = torch.compile(
+                self.model.forward_one,
+                mode="default",
+                dynamic=True,
+                fullgraph=False,
+            )
+        except Exception as exc:
+            self._compile_failed = True
+            logger.warning("Failed to enable torch.compile for Fish Speech Fast AR forward_one: %s", exc)
+            self._compiled_model_one = self.model.forward_one
+        else:
+            logger.info("Enabled torch.compile for Fish Speech Fast AR forward_one")
         if self._disable_compile_for_graph:
-            try:
-                self._compiled_model_fwd = torch.compile(
-                    self.model.forward,
-                    dynamic=True,
-                    options={"epilogue_fusion": False},
-                )
-            except Exception as exc:
-                logger.warning("Fast AR torch.compile (graph mode) failed: %s", exc)
-                self._compiled_model_fwd = self.model.forward
             return
         try:
             self._compiled_model_fwd = torch.compile(
@@ -442,11 +449,8 @@ class FishSpeechFastAR(nn.Module):
                 fullgraph=False,
             )
         except Exception as exc:
-            self._compile_failed = True
-            logger.warning("Failed to enable torch.compile for Fish Speech Fast AR: %s", exc)
+            logger.warning("Failed to enable torch.compile for Fish Speech Fast AR forward: %s", exc)
             self._compiled_model_fwd = self.model.forward
-        else:
-            logger.info("Enabled torch.compile for Fish Speech Fast AR forward (mode=default)")
 
     @torch.inference_mode()
     def warmup_compile(
@@ -456,24 +460,30 @@ class FishSpeechFastAR(nn.Module):
         batch_sizes: tuple[int, ...] = (1,),
     ) -> None:
         self._setup_compile()
-        if self._compiled_model_fwd is self.model.forward or self._compile_failed:
+        if self._compile_failed:
             return
-        for batch_size in batch_sizes:
-            hidden = torch.zeros((batch_size, self.slow_ar_config.hidden_size), device=device, dtype=dtype)
-            semantic = torch.full(
-                (batch_size,),
-                self.slow_ar_config.semantic_begin_id,
-                device=device,
-                dtype=torch.long,
-            )
-            self(hidden, semantic, do_sample=False)
-        torch.accelerator.synchronize(device)
+        try:
+            for batch_size in batch_sizes:
+                hidden = torch.zeros((batch_size, self.slow_ar_config.hidden_size), device=device, dtype=dtype)
+                semantic = torch.full(
+                    (batch_size,),
+                    self.slow_ar_config.semantic_begin_id,
+                    device=device,
+                    dtype=torch.long,
+                )
+                self(hidden, semantic, do_sample=False)
+            torch.accelerator.synchronize(device)
+        except Exception as exc:
+            logger.warning("Fast AR compile warmup failed, falling back to eager forward_one: %s", exc)
+            self._compiled_model_one = self.model.forward_one
+            self._compile_failed = True
 
     @torch.inference_mode()
     def _run_model_one(self, input_embed: torch.Tensor, step_pos_ids: torch.Tensor, cache_pos: int) -> torch.Tensor:
         assert self._k_cache is not None
         assert self._v_cache is not None
-        return self.model.forward_one(input_embed, step_pos_ids, self._k_cache, self._v_cache, cache_pos)
+        fwd = getattr(self, "_compiled_model_one", None) or self.model.forward_one
+        return fwd(input_embed, step_pos_ids, self._k_cache, self._v_cache, cache_pos)
 
     @torch.inference_mode()
     def forward(

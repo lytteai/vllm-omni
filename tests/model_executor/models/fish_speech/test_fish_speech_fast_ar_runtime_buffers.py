@@ -57,6 +57,7 @@ def test_fast_ar_reuses_dense_position_id_buffer(monkeypatch):
     fast_ar._k_cache = None
     fast_ar._v_cache = None
     fast_ar._compiled_model_fwd = None
+    fast_ar._compiled_model_one = None
     fast_ar._compile_attempted = True
     fast_ar._compile_failed = False
     fast_ar._disable_compile_for_graph = False
@@ -158,3 +159,38 @@ def test_talker_mtp_forwards_sampling_params():
     assert seen["temperature"] == 0.1
     assert seen["top_k"] == 5
     assert seen["top_p"] == 0.7
+
+
+def test_talker_mtp_uses_yaml_subtalker_defaults_when_kwargs_omitted():
+    model = object.__new__(FishSpeechSlowARForConditionalGeneration)
+    nn.Module.__init__(model)
+    model._semantic_begin_id = 4
+    model._semantic_end_id = 19
+    model._codebook_size = 16
+    model._num_codebooks = 4
+    model._subtalker_sampling_params = {
+        "do_sample": False,
+        "temperature": 0.0,
+        "top_k": 1,
+        "top_p": 1.0,
+    }
+    model.codebook_embeddings = nn.Embedding(model._num_codebooks * model._codebook_size, 8)
+    seen = {}
+
+    def fake_fast_ar(**kwargs):
+        seen.update(kwargs)
+        return torch.tensor([[0, 1, 2, 3]], dtype=torch.long)
+
+    model.fast_ar = fake_fast_ar
+    FishSpeechSlowARForConditionalGeneration.talker_mtp(
+        model,
+        torch.tensor([4], dtype=torch.long),
+        torch.randn(1, 8),
+        torch.randn(1, 8, dtype=torch.bfloat16),
+        torch.zeros(1, 8, dtype=torch.bfloat16),
+    )
+
+    assert seen["do_sample"] is False
+    assert seen["temperature"] == 0.0
+    assert seen["top_k"] == 1
+    assert seen["top_p"] == 1.0

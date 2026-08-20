@@ -21,24 +21,25 @@ def _make_transfer_manager(
     backlog_chunk_frames: int = 0,
     backlog_load_threshold: float = 0.75,
     max_num_seqs: int = 1,
+    codec_chunk_ramp: list[int] | None = None,
 ):
+    extra = {
+        "codec_chunk_frames": chunk_frames,
+        "codec_left_context_frames": left_context,
+        "initial_codec_chunk_frames": initial_chunk_frames,
+        "fish_speech_tensor_codes": tensor_payload,
+        "fish_speech_single_initial_chunk": single_initial_chunk,
+        "fish_speech_backlog_codec_chunk_frames": backlog_chunk_frames,
+        "fish_speech_backlog_load_threshold": backlog_load_threshold,
+    }
+    if codec_chunk_ramp is not None:
+        extra["codec_chunk_ramp"] = codec_chunk_ramp
     return SimpleNamespace(
         code_prompt_token_ids=defaultdict(list),
         put_req_chunk=defaultdict(int),
+        ramp_chunk_count=defaultdict(int),
         scheduler_max_num_seqs=max_num_seqs,
-        connector=SimpleNamespace(
-            config={
-                "extra": {
-                    "codec_chunk_frames": chunk_frames,
-                    "codec_left_context_frames": left_context,
-                    "initial_codec_chunk_frames": initial_chunk_frames,
-                    "fish_speech_tensor_codes": tensor_payload,
-                    "fish_speech_single_initial_chunk": single_initial_chunk,
-                    "fish_speech_backlog_codec_chunk_frames": backlog_chunk_frames,
-                    "fish_speech_backlog_load_threshold": backlog_load_threshold,
-                }
-            }
-        ),
+        connector=SimpleNamespace(config={"extra": extra}),
     )
 
 
@@ -227,3 +228,70 @@ def test_invalid_backlog_config_fails_loudly():
             {"audio_codes": torch.tensor([[1, 2, 3]])},
             request,
         )
+
+
+def test_codec_chunk_ramp_emits_after_one_slow_ar_frame():
+    transfer_manager = _make_transfer_manager(
+        tensor_payload=True,
+        chunk_frames=10,
+        left_context=25,
+        initial_chunk_frames=4,
+        single_initial_chunk=True,
+        codec_chunk_ramp=[1, 2, 4, 10],
+    )
+    request = _make_request()
+
+    first = slow_ar_to_dac_decoder_async_chunk(
+        transfer_manager,
+        {"audio_codes": torch.tensor([[1, 2, 3]])},
+        request,
+    )
+    assert first is not None
+    assert first.codes.audio.shape[-1] == 1
+    transfer_manager.ramp_chunk_count["req"] += 1
+
+    assert (
+        slow_ar_to_dac_decoder_async_chunk(
+            transfer_manager,
+            {"audio_codes": torch.tensor([[4, 5, 6]])},
+            request,
+        )
+        is None
+    )
+    second = slow_ar_to_dac_decoder_async_chunk(
+        transfer_manager,
+        {"audio_codes": torch.tensor([[7, 8, 9]])},
+        request,
+    )
+    assert second is not None
+    assert second.meta.left_context_size == 1
+    assert second.codes.audio.shape[-1] == 3
+
+
+def test_request_initial_chunk_frames_overrides_ramp():
+    transfer_manager = _make_transfer_manager(
+        tensor_payload=True,
+        chunk_frames=10,
+        left_context=10,
+        initial_chunk_frames=1,
+        single_initial_chunk=True,
+        codec_chunk_ramp=[1, 2, 4, 10],
+    )
+    request = _make_request()
+    request.additional_information = {"initial_codec_chunk_frames": [2]}
+
+    assert (
+        slow_ar_to_dac_decoder_async_chunk(
+            transfer_manager,
+            {"audio_codes": torch.tensor([[1, 2, 3]])},
+            request,
+        )
+        is None
+    )
+    payload = slow_ar_to_dac_decoder_async_chunk(
+        transfer_manager,
+        {"audio_codes": torch.tensor([[4, 5, 6]])},
+        request,
+    )
+    assert payload is not None
+    assert payload.codes.audio.shape[-1] == 2

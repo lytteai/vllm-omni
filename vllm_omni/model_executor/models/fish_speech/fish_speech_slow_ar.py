@@ -196,6 +196,10 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         self.talker_mtp_output_key = ("codes", "audio")
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {("hidden_states", "last")}
         self.talker_mtp_graph_safe = True
+        raw_subtalker = getattr(vllm_config.model_config, "subtalker_sampling_params", None)
+        self._subtalker_sampling_params: dict[str, Any] = (
+            dict(raw_subtalker) if isinstance(raw_subtalker, dict) else {}
+        )
 
         # Qwen3 transformer backbone.
         self.model = Qwen3Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
@@ -677,18 +681,27 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         input_ids = input_ids.reshape(bsz, 1).to(dtype=torch.long, device=dev)
         past_hidden = last_talker_hidden.reshape(bsz, -1).to(dtype=torch.bfloat16, device=dev)
 
-        # Run Fast AR to predict all num_codebooks codes.
+        # YAML subtalker_sampling_params are the default; runner kwargs override.
+        params = getattr(self, "_subtalker_sampling_params", None) or {}
         do_sample = kwargs.get("do_sample")
         temperature = kwargs.get("temperature")
         top_k = kwargs.get("top_k")
         top_p = kwargs.get("top_p")
+        if do_sample is None:
+            do_sample = bool(params.get("do_sample", True))
+        if temperature is None:
+            temperature = float(params.get("temperature", 0.8))
+        if top_k is None:
+            top_k = int(params.get("top_k", 30))
+        if top_p is None:
+            top_p = float(params.get("top_p", 0.9))
         audio_codes = self.fast_ar(
             slow_ar_hidden=past_hidden,
             semantic_token_id=input_ids.reshape(bsz),
-            do_sample=True if do_sample is None else bool(do_sample),
-            temperature=0.8 if temperature is None else float(temperature),
-            top_k=30 if top_k is None else int(top_k),
-            top_p=0.9 if top_p is None else float(top_p),
+            do_sample=bool(do_sample),
+            temperature=float(temperature),
+            top_k=int(top_k),
+            top_p=float(top_p),
             seed=seed,
             generator=kwargs.get("generator"),
         )  # [B, num_codebooks]
@@ -815,15 +828,16 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         if truncated:
             logger.info("Truncated %d RoPE cos_sin_cache buffers to bf16 precision", truncated)
 
-        if not getattr(self, "talker_mtp_graph_safe", False):
-            try:
-                self.fast_ar.warmup_compile(
-                    device=self.codebook_embeddings.weight.device,
-                    dtype=torch.bfloat16,
-                    batch_sizes=(1,),
-                )
-            except Exception as exc:
-                logger.warning("Fish Speech Fast AR compile warmup failed: %s", exc)
+        # Fast AR decode uses compiled forward_one outside the Slow AR CUDA
+        # graph, so warm it even when talker_mtp_graph_safe is True.
+        try:
+            self.fast_ar.warmup_compile(
+                device=self.codebook_embeddings.weight.device,
+                dtype=torch.bfloat16,
+                batch_sizes=(1,),
+            )
+        except Exception as exc:
+            logger.warning("Fish Speech Fast AR compile warmup failed: %s", exc)
 
         codec_device = self.codebook_embeddings.weight.device
         _load_dac_codec(
