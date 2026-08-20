@@ -13,6 +13,28 @@ DAC_HOP_LENGTH = 2048  # 512 (decoder upsample) * 4 (quantizer upsample)
 DAC_NUM_CODEBOOKS = 10  # 1 semantic + 9 residual
 
 
+def trim_left_context_samples(
+    ctx_frames: int,
+    total_frames: int,
+    wav_len: int,
+    hop_length: int,
+) -> int:
+    """Samples to drop from the left of a streaming DAC window.
+
+    Prefer hop-aligned cuts so chunk boundaries stay at codec frame edges.
+    Fall back to proportional trim only when the decoder emitted fewer samples
+    than ``frames * hop``.
+    """
+    if ctx_frames <= 0 or wav_len <= 0:
+        return 0
+    hop_cut = int(ctx_frames) * int(hop_length)
+    if 0 < hop_cut < wav_len:
+        return hop_cut
+    denom = max(int(total_frames), 1)
+    cut = int(ctx_frames / denom * wav_len)
+    return max(0, min(cut, wav_len))
+
+
 def build_dac_codec() -> nn.Module:
     """Construct a DAC codec model (uninitialized weights).
 

@@ -1,7 +1,9 @@
 # Fish Speech S2 Pro — single NVIDIA L4 24GB, low-latency phone TTS.
 #
 # Tuned for one in-flight call: FULL decode CUDA graphs at batch=1, greedy
-# Fast AR (Slow AR stays sampled), 2-frame first DAC chunk then ramp 4/10.
+# Fast AR (Slow AR stays sampled), 4-frame DAC chunks throughout.
+# Each Slow AR token is 2048/44100 ≈ 46.4 ms of audio. If Stage-0 ITL stays
+# above that, 10-frame chunks open ~250 ms playback holes (sounds like cutoff).
 #
 # Slow AR decode is not chunked-prefill-safe — keep enable_chunked_prefill false
 # and max_num_batched_tokens >= max_model_len.
@@ -23,12 +25,11 @@ connectors:
       connector_get_max_wait: 300
       fish_speech_tensor_codes: true
       fish_speech_single_initial_chunk: true
-      # First DAC after 2 Slow AR tokens (~93 ms of 44.1 kHz). Then 4, 10.
-      # 1-frame first chunks hit a [Q, 1] SHM stride bug and sound unstable.
-      codec_chunk_frames: 10
+      # 4-frame chunks (~186 ms). Stay here until Stage-0 vllm_itl_ms < 46.
+      # 1–2 frame first audio warbles; ramping to 10 frames underruns on L4.
+      codec_chunk_frames: 4
       codec_left_context_frames: 25
-      initial_codec_chunk_frames: 2
-      codec_chunk_ramp: [2, 4, 10]
+      initial_codec_chunk_frames: 4
       fish_speech_dac_dtype: fp16
 
 stages:

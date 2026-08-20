@@ -42,6 +42,12 @@ from .configuration_fish_speech import FishSpeechFastARConfig, FishSpeechSlowARC
 logger = init_logger(__name__)
 
 
+def _causal_sdpa_block(max_seq: int, device: torch.device) -> torch.Tensor:
+    """Bool SDPA mask of shape ``[max_seq, 1, 1, max_seq]``. True = blocked."""
+    pos = torch.arange(max_seq, device=device)
+    return pos.view(1, 1, 1, max_seq) > pos.view(max_seq, 1, 1, 1)
+
+
 # ===================================================================
 #  Standalone Fast AR Layers (no vLLM paged attention)
 # ===================================================================
@@ -149,10 +155,19 @@ class _FastARAttention(nn.Module):
         k_cache[:bsz, :, cache_pos, :] = k
         v_cache[:bsz, :, cache_pos, :] = v
 
+        # Static KV length so the residual loop can live in a CUDA graph.
+        # Dynamic ``:cache_pos+1`` slices change SDPA shape every step.
+        # Tail slots must stay zeroed; a NaN in a masked key can leak through SDPA.
+        max_seq = int(k_cache.shape[2])
+        block = getattr(self, "_sdpa_block", None)
+        if block is None or block.shape[-1] != max_seq or block.device != k_cache.device:
+            self._sdpa_block = _causal_sdpa_block(max_seq, k_cache.device)
+            block = self._sdpa_block
         attn_out = F.scaled_dot_product_attention(
             q,
-            k_cache[:bsz, :, : cache_pos + 1, :],
-            v_cache[:bsz, :, : cache_pos + 1, :],
+            k_cache[:bsz],
+            v_cache[:bsz],
+            attn_mask=block[cache_pos : cache_pos + 1],
             scale=self.scaling,
             is_causal=False,
             enable_gqa=self._use_gqa,
@@ -388,11 +403,16 @@ class FishSpeechFastAR(nn.Module):
         self._pos_ids: torch.Tensor | None = None
         self._k_cache: torch.Tensor | None = None
         self._v_cache: torch.Tensor | None = None
+        self._codes_buf: torch.Tensor | None = None
         self._compiled_model_fwd: object | None = None
         self._compiled_model_one: object | None = None
         self._compile_attempted = False
         self._compile_failed = False
         self._disable_compile_for_graph = False
+        self._greedy_graph = None
+        self._g_hidden: torch.Tensor | None = None
+        self._g_semantic: torch.Tensor | None = None
+        self._capturing_greedy_graph = False
 
     def _ensure_buffers(self, bsz: int, device: torch.device, dtype: torch.dtype) -> None:
         max_seq = self._num_codebooks + 1  # hidden_state + num_codebooks codes
@@ -410,6 +430,9 @@ class FishSpeechFastAR(nn.Module):
             and self._k_cache.shape[1] >= bsz
             and self._k_cache.device == device
             and self._k_cache.dtype == dtype
+            and getattr(self, "_codes_buf", None) is not None
+            and self._codes_buf.shape[0] >= bsz
+            and self._codes_buf.device == device
         ):
             return
         self._embed_buf = torch.zeros(bsz, max_seq, self._fast_dim, dtype=dtype, device=device)
@@ -417,8 +440,14 @@ class FishSpeechFastAR(nn.Module):
         num_layers = self.config.num_hidden_layers
         num_kv_heads = self.config.num_key_value_heads
         head_dim = self.config.head_dim
-        self._k_cache = torch.empty(num_layers, bsz, num_kv_heads, max_seq, head_dim, dtype=dtype, device=device)
-        self._v_cache = torch.empty_like(self._k_cache)
+        self._k_cache = torch.zeros(num_layers, bsz, num_kv_heads, max_seq, head_dim, dtype=dtype, device=device)
+        self._v_cache = torch.zeros_like(self._k_cache)
+        self._codes_buf = torch.empty(bsz, self._num_codebooks, dtype=torch.long, device=device)
+        model = getattr(self, "model", None)
+        if model is not None:
+            block = _causal_sdpa_block(max_seq, device)
+            for layer in model.layers:
+                layer.self_attn._sdpa_block = block
 
     def _setup_compile(self) -> None:
         if self._compile_attempted:
@@ -459,6 +488,13 @@ class FishSpeechFastAR(nn.Module):
         dtype: torch.dtype,
         batch_sizes: tuple[int, ...] = (1,),
     ) -> None:
+        # Prefer one CUDA graph of the greedy residual loop. torch.compile of
+        # forward_one is the fallback when capture fails. Skip when the runner
+        # wraps talker_mtp itself (nested graph.replay is illegal).
+        if device.type == "cuda" and not self._disable_compile_for_graph:
+            self._maybe_capture_greedy_graph(device, dtype)
+            if getattr(self, "_greedy_graph", None) is not None:
+                return
         self._setup_compile()
         if self._compile_failed:
             return
@@ -477,6 +513,39 @@ class FishSpeechFastAR(nn.Module):
             logger.warning("Fast AR compile warmup failed, falling back to eager forward_one: %s", exc)
             self._compiled_model_one = self.model.forward_one
             self._compile_failed = True
+
+    def _maybe_capture_greedy_graph(self, device: torch.device, dtype: torch.dtype) -> None:
+        if getattr(self, "_greedy_graph", None) is not None:
+            return
+        self._ensure_buffers(1, device, dtype)
+        self._g_hidden = torch.zeros((1, self.slow_ar_config.hidden_size), device=device, dtype=dtype)
+        self._g_semantic = torch.zeros((1,), device=device, dtype=torch.long)
+        try:
+            for _ in range(2):
+                self(self._g_hidden, self._g_semantic, do_sample=False)
+            torch.accelerator.synchronize(device)
+            pool = None
+            try:
+                from vllm.platforms import current_platform
+
+                pool = current_platform.get_global_graph_pool()
+            except Exception:
+                pool = None
+            self._capturing_greedy_graph = True
+            graph = torch.cuda.CUDAGraph()
+            if pool is not None:
+                ctx = torch.cuda.graph(graph, pool=pool)
+            else:
+                ctx = torch.cuda.graph(graph)
+            with ctx:
+                self(self._g_hidden, self._g_semantic, do_sample=False)
+            self._greedy_graph = graph
+            logger.info("Captured CUDA graph for Fish Speech Fast AR greedy residual loop")
+        except Exception as exc:
+            logger.warning("Fast AR greedy CUDA graph capture failed: %s", exc)
+            self._greedy_graph = None
+        finally:
+            self._capturing_greedy_graph = False
 
     @torch.inference_mode()
     def _run_model_one(self, input_embed: torch.Tensor, step_pos_ids: torch.Tensor, cache_pos: int) -> torch.Tensor:
@@ -520,10 +589,32 @@ class FishSpeechFastAR(nn.Module):
         # Clamp to valid range: im_end or other non-semantic tokens map to 0 (pad).
         semantic_code = (semantic_token_id.reshape(bsz) - semantic_begin).clamp(min=0, max=codebook_size - 1)
 
-        all_codes = torch.empty(bsz, num_cb, dtype=torch.long, device=device)
-        all_codes[:, 0] = semantic_code
+        use_sampling = do_sample and temperature > 0
+        graph = getattr(self, "_greedy_graph", None)
+        if (
+            graph is not None
+            and not use_sampling
+            and bsz == 1
+            and device.type == "cuda"
+            and not getattr(self, "_capturing_greedy_graph", False)
+        ):
+            capturing = False
+            try:
+                capturing = bool(torch.cuda.is_current_stream_capturing())
+            except Exception:
+                capturing = False
+            if not capturing:
+                assert self._g_hidden is not None and self._g_semantic is not None
+                self._g_hidden.copy_(slow_ar_hidden.reshape(1, -1))
+                self._g_semantic.copy_(semantic_token_id.reshape(1).to(dtype=torch.long))
+                graph.replay()
+                assert self._codes_buf is not None
+                return self._codes_buf[:1]
 
         self._ensure_buffers(bsz, device, dtype)
+        assert self._codes_buf is not None
+        all_codes = self._codes_buf[:bsz]
+        all_codes[:, 0] = semantic_code
 
         embed_buf = self._embed_buf
         pos_ids = self._pos_ids
@@ -536,7 +627,6 @@ class FishSpeechFastAR(nn.Module):
         code_embed = self.fast_embeddings(semantic_code)
         embed_buf[:bsz, 1, :] = code_embed
 
-        use_sampling = do_sample and temperature > 0
         inv_temperature = 1.0 / max(temperature, 1e-6) if use_sampling else 0.0
 
         # Create a seeded generator for deterministic residual codebook sampling.

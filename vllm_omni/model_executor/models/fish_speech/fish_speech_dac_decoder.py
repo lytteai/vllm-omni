@@ -28,6 +28,7 @@ from vllm_omni.model_executor.models.fish_speech.dac_utils import (
     DAC_NUM_CODEBOOKS,
     DAC_SAMPLE_RATE,
     build_dac_codec,
+    trim_left_context_samples,
 )
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 
@@ -453,12 +454,12 @@ class FishSpeechDACDecoder(nn.Module):
             assert wav is not None
             # Trim context frames (left overlap for streaming).
             if ctx_frames > 0:
-                # Decode length may deviate from (frames * hop_length) due to model
-                # internals (padding/rounding). Use proportional trimming to keep
-                # overlap removal aligned with the actual decoded length.
-                denom = max(int(total_frames), 1)
-                cut = int(ctx_frames / denom * wav.shape[0])
-                cut = max(0, min(cut, int(wav.shape[0])))
+                cut = trim_left_context_samples(
+                    ctx_frames,
+                    total_frames,
+                    int(wav.shape[0]),
+                    self._hop_length,
+                )
                 if cut < wav.shape[0]:
                     wav = wav[cut:]
                 else:

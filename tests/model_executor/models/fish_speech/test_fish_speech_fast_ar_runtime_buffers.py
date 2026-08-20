@@ -56,6 +56,9 @@ def test_fast_ar_reuses_dense_position_id_buffer(monkeypatch):
     fast_ar._pos_ids = None
     fast_ar._k_cache = None
     fast_ar._v_cache = None
+    fast_ar._codes_buf = None
+    fast_ar._greedy_graph = None
+    fast_ar._capturing_greedy_graph = False
     fast_ar._compiled_model_fwd = None
     fast_ar._compiled_model_one = None
     fast_ar._compile_attempted = True
