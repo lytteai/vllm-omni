@@ -281,13 +281,3 @@ def test_trim_left_context_samples_prefers_hop_alignment():
     assert trim_left_context_samples(2, 6, 6 * 2048, 2048) == 2 * 2048
     assert trim_left_context_samples(1, 2, 100, 512) == 50
     assert trim_left_context_samples(0, 4, 8000, 2048) == 0
-
-
-def test_fast_ar_causal_sdpa_block_masks_future_keys():
-    from vllm_omni.model_executor.models.fish_speech.fish_speech_fast_ar import _causal_sdpa_block
-
-    block = _causal_sdpa_block(5, torch.device("cpu"))
-    assert block.shape == (5, 1, 1, 5)
-    # cache_pos=2 may attend to keys 0..2 and must block 3..4.
-    mask = block[2:3].view(-1)
-    assert torch.equal(mask, torch.tensor([False, False, False, True, True]))

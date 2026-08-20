@@ -1,9 +1,13 @@
 # Fish Speech S2 Pro — single NVIDIA L4 24GB, low-latency phone TTS.
 #
-# Tuned for one in-flight call: FULL decode CUDA graphs at batch=1, greedy
-# Fast AR (Slow AR stays sampled), 4-frame DAC chunks throughout.
-# Each Slow AR token is 2048/44100 ≈ 46.4 ms of audio. If Stage-0 ITL stays
-# above that, 10-frame chunks open ~250 ms playback holes (sounds like cutoff).
+# Tuned for one in-flight call: FULL decode CUDA graphs at batch=1.
+# Fast AR residual codes stay greedy so the runner can wrap talker_mtp;
+# Slow AR semantic tokens stay sampled (temperature 0.8) for natural speech.
+# Do not capture a custom Fast AR CUDA graph — static-KV SDPA / graph replay
+# corrupts residual codes and the voice stops sounding human.
+#
+# 4-frame DAC chunks (~186 ms). Each Slow AR token is 2048/44100 ≈ 46.4 ms
+# of audio. 10-frame chunks open playback holes when Stage-0 ITL > 46 ms.
 #
 # Slow AR decode is not chunked-prefill-safe — keep enable_chunked_prefill false
 # and max_num_batched_tokens >= max_model_len.

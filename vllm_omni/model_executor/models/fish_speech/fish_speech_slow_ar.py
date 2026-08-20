@@ -195,7 +195,7 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         self.mtp_hidden_size = int(self.text_config.hidden_size)
         self.talker_mtp_output_key = ("codes", "audio")
         self.gpu_resident_buffer_keys: set[tuple[str, str]] = {("hidden_states", "last")}
-        self.talker_mtp_graph_safe = False
+        self.talker_mtp_graph_safe = True
         raw_subtalker = getattr(vllm_config.model_config, "subtalker_sampling_params", None)
         self._subtalker_sampling_params: dict[str, Any] = (
             dict(raw_subtalker) if isinstance(raw_subtalker, dict) else {}
@@ -828,8 +828,8 @@ class FishSpeechSlowARForConditionalGeneration(nn.Module):
         if truncated:
             logger.info("Truncated %d RoPE cos_sin_cache buffers to bf16 precision", truncated)
 
-        # Fast AR owns its greedy CUDA graph (talker_mtp_graph_safe is False
-        # so the runner does not wrap the Python residual loop). Warm it here.
+        # Fast AR decode uses compiled forward_one outside the Slow AR CUDA
+        # graph, so warm it even when talker_mtp_graph_safe is True.
         try:
             self.fast_ar.warmup_compile(
                 device=self.codebook_embeddings.weight.device,
