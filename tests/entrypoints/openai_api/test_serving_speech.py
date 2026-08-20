@@ -2814,29 +2814,47 @@ def test_api_server_create_speech_wraps_error_response_status(mocker: MockerFixt
         )
     )
 
-    raw_request = _make_api_server_request(handler, path="/v1/audio/speech")
-    request = OpenAICreateSpeechRequest(input="Hello")
+    raw_request = _make_api_server_request(
+        handler,
+        path="/v1/audio/speech",
+        body=b'{"input":"Hello"}',
+        content_type="application/json",
+    )
 
-    response = asyncio.run(api_server_module.create_speech(request, raw_request))
+    response = asyncio.run(api_server_module.create_speech(raw_request))
 
     _assert_openai_error_response(response, status_code=400, message="bad request")
 
 
-def _make_api_server_request(handler, *, method: str = "POST", path: str = "/v1/audio/voices") -> Request:
+def _make_api_server_request(
+    handler,
+    *,
+    method: str = "POST",
+    path: str = "/v1/audio/voices",
+    body: bytes = b"",
+    content_type: str | None = None,
+) -> Request:
     app = FastAPI()
     app.state.openai_serving_speech = handler
+    headers = []
+    if content_type:
+        headers.append((b"content-type", content_type.encode("latin-1")))
     scope = {
         "type": "http",
         "app": app,
         "method": method,
         "path": path,
-        "headers": [],
+        "headers": headers,
         "query_string": b"",
         "client": ("127.0.0.1", 12345),
         "server": ("testserver", 80),
         "scheme": "http",
     }
-    return Request(scope)
+
+    async def receive():
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return Request(scope, receive)
 
 
 def _patch_api_server_base(mocker: MockerFixture):
@@ -3034,9 +3052,8 @@ def test_api_server_create_speech_without_handler_returns_404(mocker: MockerFixt
     fake_base = _patch_api_server_base(mocker)
     raw_request = _make_api_server_request(None, path="/v1/audio/speech")
     raw_request.app.state.serving_tokenization = fake_base
-    request = OpenAICreateSpeechRequest(input="Hello")
 
-    response = asyncio.run(api_server_module.create_speech(request, raw_request))
+    response = asyncio.run(api_server_module.create_speech(raw_request))
 
     _assert_openai_error_response(
         response, status_code=404, message="does not support Speech API", err_type="NotFoundError"
@@ -3136,7 +3153,12 @@ def test_api_server_create_speech_engine_error_response_includes_request_and_sta
 
     terminate_mock = mocker.patch.object(api_server_module, "terminate_if_errored")
 
-    raw_request = _make_api_server_request(handler, path="/v1/audio/speech")
+    raw_request = _make_api_server_request(
+        handler,
+        path="/v1/audio/speech",
+        body=b'{"input":"Hello"}',
+        content_type="application/json",
+    )
     raw_request.app.state.args = SimpleNamespace(log_error_stack=False)
     raw_request.app.state.engine_client = SimpleNamespace(
         engine=SimpleNamespace(is_alive=lambda: False),
@@ -3144,9 +3166,8 @@ def test_api_server_create_speech_engine_error_response_includes_request_and_sta
     )
     raw_request.app.state.server = SimpleNamespace()
     raw_request.state.request_metadata = SimpleNamespace(request_id="speech-req-1")
-    request = OpenAICreateSpeechRequest(input="Hello")
 
-    response = asyncio.run(api_server_module.create_speech(request, raw_request))
+    response = asyncio.run(api_server_module.create_speech(raw_request))
 
     assert isinstance(response, JSONResponse)
     assert response.status_code == 500

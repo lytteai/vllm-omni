@@ -246,6 +246,8 @@ vllm serve fishaudio/s2-pro --omni --port 8091
 The deploy config auto-loads from `vllm_omni/deploy/fish_qwen3_omni.yaml` (the HF `model_type` on the fishaudio checkpoint is `fish_qwen3_omni`).
 
 ### Voice cloning
+JSON (URL or base64 data URL):
+
 ```bash
 curl -X POST http://localhost:8091/v1/audio/speech \
     -H "Content-Type: application/json" \
@@ -255,6 +257,18 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         "ref_audio": "https://example.com/reference.wav",
         "ref_text": "Transcript of the reference audio."
     }' --output cloned.wav
+```
+
+Upload a local reference clip with `multipart/form-data` (no URL required):
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -F "model=fishaudio/s2-pro" \
+    -F "input=Hello, this is a cloned voice." \
+    -F "voice=default" \
+    -F "ref_audio=@/path/to/reference.wav" \
+    -F "ref_text=Transcript of the reference audio." \
+    --output cloned.wav
 ```
 
 ### CLI client

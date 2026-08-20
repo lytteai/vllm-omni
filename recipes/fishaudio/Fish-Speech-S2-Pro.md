@@ -98,7 +98,7 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 ```
 [output.wav](https://github.com/user-attachments/files/27134970/output.wav)
 
-Voice cloning:
+Voice cloning from a URL:
 
 ```bash
 curl -X POST http://localhost:8091/v1/audio/speech \
@@ -109,6 +109,17 @@ curl -X POST http://localhost:8091/v1/audio/speech \
         "ref_audio": "https://example.com/reference.wav",
         "ref_text": "Transcript of the reference audio."
     }' --output cloned.wav
+```
+
+Voice cloning from a local file:
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -F "input=Hello, this is a cloned voice." \
+    -F "voice=default" \
+    -F "ref_audio=@/path/to/reference.wav" \
+    -F "ref_text=Transcript of the reference audio." \
+    --output cloned.wav
 ```
 [reference.wav](https://github.com/user-attachments/files/27134971/reference.wav) <br>
 [cloned.wav](https://github.com/user-attachments/files/27134969/cloned.wav)

@@ -97,7 +97,7 @@ response.stream_to_file("output.wav")
 
 ```
 POST /v1/audio/speech
-Content-Type: application/json
+Content-Type: application/json | multipart/form-data
 ```
 
 ### Request Parameters
@@ -131,9 +131,21 @@ Content-Type: application/json
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `ref_audio` | string | null | Reference audio (HTTP URL, base64 data URL, or `file://` URI with `--allowed-local-media-path`) |
+| `ref_audio` | string or file | null | Reference audio. JSON: HTTP URL, base64 data URL, or `file://` URI with `--allowed-local-media-path`. `multipart/form-data`: upload a local audio file as this field (max 10MB; wav/mp3/flac/ogg/aac/webm/mp4), or pass a URL string. |
 | `ref_text` | string | null | Transcript of reference audio |
 | `x_vector_only_mode` | bool | null | Use speaker embedding only (no ICL) |
+
+Upload a local reference clip instead of a URL:
+
+```bash
+curl -X POST http://localhost:8091/v1/audio/speech \
+    -F "model=fishaudio/s2-pro" \
+    -F "input=Hello, this is a cloned voice." \
+    -F "voice=default" \
+    -F "ref_audio=@/path/to/reference.wav" \
+    -F "ref_text=Transcript of the reference audio." \
+    --output cloned.wav
+```
 
 ### Response Format
 
@@ -721,7 +733,7 @@ The bundled config also sets `initial_codec_chunk_frames: 1`. This emits only th
 |-------|-------------|
 | `fishaudio/s2-pro` | 4B dual-AR TTS with DAC codec (44.1 kHz). Supports text-to-speech and voice cloning. |
 
-Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` needed). The `voice` field should be set to `"default"`. See the [Fish Speech section of the online TTS hub](../user_guide/examples/online_serving/text_to_speech.md#fish-speech-s2-pro) for details.
+Fish Speech uses `ref_audio` and `ref_text` for voice cloning (no `task_type` needed). The `voice` field should be set to `"default"`. `ref_audio` accepts a URL, a base64 data URL, or a file upload via `multipart/form-data` (`-F ref_audio=@/path/to/reference.wav`). See the [Fish Speech section of the online TTS hub](../user_guide/examples/online_serving/text_to_speech.md#fish-speech-s2-pro) for details.
 
 ### Voxtral TTS
 

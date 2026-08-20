@@ -109,7 +109,6 @@ from vllm_omni.entrypoints.openai.image_api_utils import (
 from vllm_omni.entrypoints.openai.protocol.audio import (
     BatchSpeechRequest,
     OpenAICreateAudioGenerateRequest,
-    OpenAICreateSpeechRequest,
 )
 from vllm_omni.entrypoints.openai.protocol.images import (
     ImageData,
@@ -131,6 +130,7 @@ from vllm_omni.entrypoints.openai.realtime_connection import RealtimeConnection
 from vllm_omni.entrypoints.openai.serving_audio_generate import OmniOpenAIServingAudioGenerate
 from vllm_omni.entrypoints.openai.serving_chat import OmniOpenAIServingChat
 from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+from vllm_omni.entrypoints.openai.speech_request import parse_create_speech_request
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.openai.serving_video import (
     OmniOpenAIServingVideo,
@@ -1322,22 +1322,25 @@ _remove_route_from_router(router, "/v1/audio/speech", {"POST"})
 
 @router.post(
     "/v1/audio/speech",
-    dependencies=[Depends(validate_json_request)],
     responses={
         HTTPStatus.OK.value: {"content": {"audio/*": {}, "text/event-stream": {}}},
         HTTPStatus.BAD_REQUEST.value: {"model": ErrorResponse},
         HTTPStatus.NOT_FOUND.value: {"model": ErrorResponse},
+        HTTPStatus.UNSUPPORTED_MEDIA_TYPE.value: {"model": ErrorResponse},
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
     },
 )
 @with_cancellation
 @load_aware_call
-async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request):
+async def create_speech(raw_request: Request):
     """Generate speech audio from text using the loaded TTS model.
 
+    Accepts ``application/json`` (OpenAI-compatible body) or
+    ``multipart/form-data`` so ``ref_audio`` / ``ref_audio_2`` can be uploaded
+    as files instead of URLs.
+
     Args:
-        request: Speech synthesis request in OpenAI-compatible format.
-        raw_request: Raw FastAPI request for accessing app state.
+        raw_request: Raw FastAPI request for accessing app state and the body.
 
     Returns:
         The generated audio response, or an OpenAI-style error payload when
@@ -1361,6 +1364,7 @@ async def create_speech(request: OpenAICreateSpeechRequest, raw_request: Request
             status_code=HTTPStatus.NOT_FOUND,
         )
         return _error_response_to_json_response(err, status_code=HTTPStatus.NOT_FOUND)
+    request = await parse_create_speech_request(raw_request)
     try:
         result = await handler.create_speech(request, raw_request)
         if isinstance(result, ErrorResponse):
