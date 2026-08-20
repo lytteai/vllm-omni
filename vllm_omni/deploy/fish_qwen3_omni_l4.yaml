@@ -11,6 +11,18 @@
 # <800 ms. GPU ~95% during decode is expected.
 # Clients: stream=true, stream_format="audio", PLAYBACK_PREROLL_MS=0.
 #
+# Why fp8 is not optional here. One Slow AR step runs the 36-layer backbone
+# plus ten Fast AR passes over its four layers (one per codebook), which reads
+# ~16 GB of bf16 weights, and it buys exactly one 2048-sample DAC frame =
+# 46.4 ms of audio. An L4 peaks at 300 GB/s, so bf16 tops out near 54 ms/step
+# even at 100% bandwidth efficiency; measured is ~78 ms, i.e. 0.6x realtime,
+# and a phone call cannot be fed below 1.0x. fp8 halves the linear weights to
+# ~8.5 GB/step, which is what puts this profile over realtime. Sub-realtime is
+# not a tuning problem: no chunk size or preroll setting can fix it.
+# If residual codes sound rough, isolate it with
+# VLLM_OMNI_FISH_QUANT_FAST_AR=0 (keeps the backbone in fp8) before dropping
+# quantization entirely.
+#
 # Slow AR decode is not chunked-prefill-safe — keep enable_chunked_prefill false
 # and max_num_batched_tokens >= max_model_len.
 #
@@ -21,6 +33,8 @@
 
 async_chunk: true
 enable_chunked_prefill: false
+# Weights are quantized on load from the bf16 checkpoint; no calibration step.
+quantization: fp8
 
 connectors:
   connector_of_shared_memory:
@@ -36,6 +50,8 @@ connectors:
       codec_chunk_frames: 4
       codec_left_context_frames: 25
       initial_codec_chunk_frames: 4
+      # Stage 1 shares the GPU with Slow AR decode, so keep DAC off fp32.
+      fish_speech_dac_dtype: fp16
       speech_stream_preroll_auto: false
       speech_stream_preroll_ms: 0
       # Even if env/auto preroll is set, never hold past ~700 ms wall.
@@ -78,6 +94,10 @@ stages:
     max_num_seqs: 1
     gpu_memory_utilization: 0.12
     enforce_eager: true
+    # The DAC is convolutional and built outside vLLM's linear layers, so the
+    # pipeline-wide fp8 setting would buy nothing here; fish_speech_dac_dtype
+    # is what controls its precision.
+    quantization: null
     trust_remote_code: true
     enable_prefix_caching: false
     async_scheduling: false

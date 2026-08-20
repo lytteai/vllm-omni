@@ -16,6 +16,7 @@ Optimisations:
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterable
 
 import torch
@@ -30,6 +31,7 @@ from vllm.model_executor.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.model_loader.weight_utils import (
     default_weight_loader,
@@ -40,6 +42,19 @@ from vllm.model_executor.models.utils import is_pp_missing_parameter
 from .configuration_fish_speech import FishSpeechFastARConfig, FishSpeechSlowARConfig
 
 logger = init_logger(__name__)
+
+
+def _quantize_fast_ar_enabled() -> bool:
+    """Whether the Fast AR shares the pipeline's quantization config.
+
+    The Fast AR re-reads all four of its layers once per residual codebook, so
+    it moves as many weight bytes per Slow AR step as the 36-layer backbone
+    does, and quantizing it is worth about as much. Residual codes are the more
+    quality-sensitive half though, so this exists to isolate a regression
+    without giving up the backbone's saving too.
+    """
+    raw = os.environ.get("VLLM_OMNI_FISH_QUANT_FAST_AR", "1").strip().lower()
+    return raw not in {"0", "false", "no", "off"}
 
 
 # ===================================================================
@@ -55,7 +70,13 @@ class _FastARAttention(nn.Module):
     Input: [B, seq_len, hidden_size].
     """
 
-    def __init__(self, config: FishSpeechFastARConfig, *, prefix: str = "") -> None:
+    def __init__(
+        self,
+        config: FishSpeechFastARConfig,
+        *,
+        prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
+    ) -> None:
         super().__init__()
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
@@ -72,6 +93,7 @@ class _FastARAttention(nn.Module):
             total_num_heads=self.num_heads,
             total_num_kv_heads=self.num_kv_heads,
             bias=False,
+            quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
             disable_tp=True,
         )
@@ -79,6 +101,7 @@ class _FastARAttention(nn.Module):
             input_size=self.num_heads * self.head_dim,
             output_size=self.hidden_size,
             bias=False,
+            quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
             disable_tp=True,
         )
@@ -165,12 +188,19 @@ class _FastARAttention(nn.Module):
 class _FastARMLP(nn.Module):
     """SiLU-gated MLP, matching Qwen3/LLaMA MLP structure."""
 
-    def __init__(self, config: FishSpeechFastARConfig, *, prefix: str = "") -> None:
+    def __init__(
+        self,
+        config: FishSpeechFastARConfig,
+        *,
+        prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
+    ) -> None:
         super().__init__()
         self.gate_up_proj = MergedColumnParallelLinear(
             input_size=config.hidden_size,
             output_sizes=[config.intermediate_size] * 2,
             bias=False,
+            quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
             disable_tp=True,
         )
@@ -178,6 +208,7 @@ class _FastARMLP(nn.Module):
             input_size=config.intermediate_size,
             output_size=config.hidden_size,
             bias=False,
+            quant_config=quant_config,
             prefix=f"{prefix}.down_proj",
             disable_tp=True,
         )
@@ -197,10 +228,16 @@ class _FastARDecoderLayer(nn.Module):
     while ``forward_one`` decodes a single step using a per-call KV cache.
     """
 
-    def __init__(self, config: FishSpeechFastARConfig, *, prefix: str = "") -> None:
+    def __init__(
+        self,
+        config: FishSpeechFastARConfig,
+        *,
+        prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
+    ) -> None:
         super().__init__()
-        self.self_attn = _FastARAttention(config, prefix=f"{prefix}.self_attn")
-        self.mlp = _FastARMLP(config, prefix=f"{prefix}.mlp")
+        self.self_attn = _FastARAttention(config, prefix=f"{prefix}.self_attn", quant_config=quant_config)
+        self.mlp = _FastARMLP(config, prefix=f"{prefix}.mlp", quant_config=quant_config)
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
@@ -244,11 +281,20 @@ class _FastARDecoderLayer(nn.Module):
 class FishSpeechFastARModel(nn.Module):
     """4-layer transformer for residual codebook prediction (re-prefill)."""
 
-    def __init__(self, config: FishSpeechFastARConfig, *, prefix: str = "") -> None:
+    def __init__(
+        self,
+        config: FishSpeechFastARConfig,
+        *,
+        prefix: str = "",
+        quant_config: QuantizationConfig | None = None,
+    ) -> None:
         super().__init__()
         self.config = config
         self.layers = nn.ModuleList(
-            [_FastARDecoderLayer(config, prefix=f"{prefix}.layers.{i}") for i in range(config.num_hidden_layers)]
+            [
+                _FastARDecoderLayer(config, prefix=f"{prefix}.layers.{i}", quant_config=quant_config)
+                for i in range(config.num_hidden_layers)
+            ]
         )
         # NOTE: final norm is handled by FishSpeechFastAR.fast_norm (one norm weight
         # in checkpoint: audio_decoder.norm.weight → fast_ar.fast_norm.weight).
@@ -361,7 +407,10 @@ class FishSpeechFastAR(nn.Module):
         self.config = config
         self.slow_ar_config = slow_ar_config
 
-        self.model = FishSpeechFastARModel(config, prefix=f"{prefix}.model")
+        quant_config = vllm_config.quant_config if _quantize_fast_ar_enabled() else None
+        if quant_config is not None:
+            logger.info("Fish Speech Fast AR linears use %s quantization", quant_config.get_name())
+        self.model = FishSpeechFastARModel(config, prefix=f"{prefix}.model", quant_config=quant_config)
 
         # Codebook embeddings for Fast AR (separate from Slow AR's codebook_embeddings).
         self.fast_embeddings = nn.Embedding(config.vocab_size, config.hidden_size)
