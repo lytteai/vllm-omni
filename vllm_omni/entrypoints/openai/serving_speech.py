@@ -192,20 +192,12 @@ def _speech_stream_preroll_ms_from_config(
 ) -> int:
     """Hold this many ms of PCM before the first streamed audio byte.
 
-    L4 Fish generates slower than realtime (~0.62x). Starting playback on the
-    first DAC crumb underruns. A waterline lets the HTTP client start sooner
-    than a full WAV while keeping enough buffer to finish a typical IVR line.
-
-    ``VLLM_OMNI_SPEECH_STREAM_PREROLL_MS`` overrides yaml when set.
-    ``speech_stream_preroll_auto`` sizes the waterline from prompt length.
+    ``VLLM_OMNI_SPEECH_STREAM_PREROLL_MS`` sets a PCM waterline when present.
+    ``speech_stream_preroll_auto`` sizes it from prompt length.
+    ``speech_stream_max_first_chunk_ms`` caps that waterline so first-byte wall
+    time cannot exceed the budget (PCM_ms <= wall_ms * gen_rtf).
     """
     extras = _collect_speech_connector_extras(model_config, engine_client)
-    env_raw = os.environ.get("VLLM_OMNI_SPEECH_STREAM_PREROLL_MS")
-    if env_raw is not None and str(env_raw).strip() != "":
-        try:
-            return max(0, int(env_raw))
-        except (TypeError, ValueError):
-            return 0
 
     def _as_int(raw: Any, default: int) -> int:
         if raw is None:
@@ -230,18 +222,28 @@ def _speech_stream_preroll_ms_from_config(
             return False
         return str(raw).strip().lower() in {"1", "true", "yes", "on"}
 
-    auto = _as_bool(_first_connector_extra_value(extras, "speech_stream_preroll_auto"))
-    if auto:
-        min_ms = max(0, _as_int(_first_connector_extra_value(extras, "speech_stream_preroll_min_ms"), 900))
-        max_ms = max(min_ms, _as_int(_first_connector_extra_value(extras, "speech_stream_preroll_max_ms"), 3500))
-        rtf = min(max(_as_float(_first_connector_extra_value(extras, "speech_stream_gen_rtf"), 0.62), 0.05), 0.95)
-        cps = max(_as_float(_first_connector_extra_value(extras, "speech_stream_chars_per_sec"), 16.0), 1.0)
-        text_len = len(prompt_text or "")
-        est_s = max(text_len / cps, min_ms / 1000.0)
-        needed_ms = int(est_s * (1.0 - rtf) * 1250.0)
-        return max(min_ms, min(max_ms, needed_ms))
+    env_raw = os.environ.get("VLLM_OMNI_SPEECH_STREAM_PREROLL_MS")
+    if env_raw is not None and str(env_raw).strip() != "":
+        preroll_ms = max(0, _as_int(env_raw, 0))
+    else:
+        auto = _as_bool(_first_connector_extra_value(extras, "speech_stream_preroll_auto"))
+        if auto:
+            min_ms = max(0, _as_int(_first_connector_extra_value(extras, "speech_stream_preroll_min_ms"), 900))
+            max_ms = max(min_ms, _as_int(_first_connector_extra_value(extras, "speech_stream_preroll_max_ms"), 3500))
+            rtf = min(max(_as_float(_first_connector_extra_value(extras, "speech_stream_gen_rtf"), 0.62), 0.05), 0.95)
+            cps = max(_as_float(_first_connector_extra_value(extras, "speech_stream_chars_per_sec"), 16.0), 1.0)
+            text_len = len(prompt_text or "")
+            est_s = max(text_len / cps, min_ms / 1000.0)
+            needed_ms = int(est_s * (1.0 - rtf) * 1250.0)
+            preroll_ms = max(min_ms, min(max_ms, needed_ms))
+        else:
+            preroll_ms = max(0, _as_int(_first_connector_extra_value(extras, "speech_stream_preroll_ms"), 0))
 
-    return max(0, _as_int(_first_connector_extra_value(extras, "speech_stream_preroll_ms"), 0))
+    max_wall_ms = max(0, _as_int(_first_connector_extra_value(extras, "speech_stream_max_first_chunk_ms"), 0))
+    if max_wall_ms > 0 and preroll_ms > 0:
+        rtf_cap = min(max(_as_float(_first_connector_extra_value(extras, "speech_stream_gen_rtf"), 0.62), 0.05), 0.95)
+        preroll_ms = min(preroll_ms, int(max_wall_ms * rtf_cap))
+    return max(0, preroll_ms)
 
 
 def _create_wav_header(sample_rate: int, num_channels: int = 1, bits_per_sample: int = 16) -> bytes:

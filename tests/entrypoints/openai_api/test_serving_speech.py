@@ -4377,6 +4377,19 @@ def test_speech_stream_preroll_env_overrides_yaml(monkeypatch):
     assert _speech_stream_preroll_ms_from_config(cfg) == 800
 
 
+def test_speech_stream_max_first_chunk_caps_env_preroll(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_SPEECH_STREAM_PREROLL_MS", "1500")
+    cfg = SimpleNamespace(
+        stage_connector_config={
+            "extra": {
+                "speech_stream_max_first_chunk_ms": 700,
+                "speech_stream_gen_rtf": 0.62,
+            }
+        }
+    )
+    assert _speech_stream_preroll_ms_from_config(cfg) == int(700 * 0.62)
+
+
 def test_speech_stream_preroll_auto_from_prompt(monkeypatch):
     monkeypatch.delenv("VLLM_OMNI_SPEECH_STREAM_PREROLL_MS", raising=False)
     cfg = SimpleNamespace(

@@ -6,16 +6,16 @@
 # Do not capture a custom Fast AR CUDA graph — static-KV SDPA / graph replay
 # corrupts residual codes and the voice stops sounding human.
 #
-# First DAC window is 4 frames (~186 ms audio, ~370 ms wall). HTTP then holds a
-# prompt-sized PCM waterline so Twilio does not underrun on 0.62x L4 generation.
-# ITL spikes above 76 ms are why cutoff is intermittent — budget rtf 0.55.
-# GPU ~95% during decode is expected (L4 is compute-bound, not idle).
-# Clients: stream=true, stream_format="audio", and no extra client preroll.
+# First DAC window is 4 frames (~186 ms audio, ~370 ms wall). No HTTP preroll —
+# holding 1–2 s of PCM at 0.55x RTF made first-byte 3–4 s. Target HTTP TTFT
+# <800 ms. GPU ~95% during decode is expected.
+# Clients: stream=true, stream_format="audio", PLAYBACK_PREROLL_MS=0.
 #
 # Slow AR decode is not chunked-prefill-safe — keep enable_chunked_prefill false
 # and max_num_batched_tokens >= max_model_len.
 #
 #   unset VLLM_OMNI_FISH_KVCACHE_ATTN
+#   unset VLLM_OMNI_SPEECH_STREAM_PREROLL_MS
 #   vllm serve fishaudio/s2-pro --omni --port 8000 \
 #       --deploy-config vllm_omni/deploy/fish_qwen3_omni_l4.yaml
 
@@ -36,13 +36,11 @@ connectors:
       codec_chunk_frames: 4
       codec_left_context_frames: 25
       initial_codec_chunk_frames: 4
-      # Hold enough PCM to cover estimated duration at a conservative 0.55x RTF.
-      # Short lines ~0.5–1.0 s to first HTTP byte; long IVR holds more, not 20 frames.
-      speech_stream_preroll_auto: true
-      speech_stream_preroll_min_ms: 500
-      speech_stream_preroll_max_ms: 2000
-      speech_stream_gen_rtf: 0.55
-      speech_stream_chars_per_sec: 12
+      speech_stream_preroll_auto: false
+      speech_stream_preroll_ms: 0
+      # Even if env/auto preroll is set, never hold past ~700 ms wall.
+      speech_stream_max_first_chunk_ms: 700
+      speech_stream_gen_rtf: 0.62
 
 stages:
   - stage_id: 0
